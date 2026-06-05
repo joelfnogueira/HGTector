@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 
 # ----------------------------------------------------------------------------
@@ -17,12 +16,10 @@ from os.path import join, isfile, isdir, getsize, basename
 from shutil import which, rmtree
 from time import sleep
 from tempfile import mkdtemp
-import sched
-import platform
 
 import pandas as pd
 
-# Import from hgtector.util – if not available, provide fallback implementations
+# Try to import from hgtector.util; if not available, provide minimal stubs
 try:
     from hgtector.util import (
         timestamp, load_configs, get_config, arg2bool, run_command,
@@ -30,13 +27,7 @@ try:
         taxid_at_rank, taxids_at_ranks, is_ancestral, find_lca, rank_plural
     )
 except ImportError:
-    # Fallback stub for run_command and other utilities (should not happen in normal use)
-    def run_command(cmd):
-        import subprocess
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate()
-        return proc.returncode, out.decode() if out else ""
-
+    # Stubs to allow the script to run if hgtector is not installed
     def timestamp():
         from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -57,11 +48,39 @@ except ImportError:
             return param
         return [x.strip() for x in str(param).split(',')]
 
+    def run_command(cmd):
+        import subprocess
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        return proc.returncode, out.decode() if out else ""
+
+    # The following stubs are minimal; real taxonomy handling requires hgtector
     def read_taxdump(tmpdir):
-        # Minimal stub; actual implementation would be required if hgtector not available
         raise NotImplementedError("hgtector.util is required for taxonomy handling")
 
-    # Other stubs omitted – assume hgtector is installed in real use
+    def contain_words(name, words):
+        return any(w in name for w in words)
+
+    def is_latin(name):
+        return True  # dummy
+
+    def is_capital(name):
+        return name[0].isupper() if name else False
+
+    def taxid_at_rank(tid, rank, taxdump):
+        return tid
+
+    def taxids_at_ranks(tid, ranks, taxdump):
+        return [tid] * len(ranks)
+
+    def is_ancestral(tid, ancestors, taxdump):
+        return tid in ancestors
+
+    def find_lca(tids, taxdump):
+        return tids[0]
+
+    def rank_plural(rank):
+        return rank + 's'
 
 description = """build reference protein sequence and taxonomy database"""
 
@@ -190,13 +209,20 @@ class Database(object):
         for key in 'capital', 'latin':
             setattr(self, key, arg2bool(getattr(self, key, None)))
 
+        # Set default values for download parameters if not provided
+        if not hasattr(self, 'retries') or self.retries is None:
+            self.retries = 3
+        if not hasattr(self, 'delay') or self.delay is None:
+            self.delay = 5
+        if not hasattr(self, 'timeout') or self.timeout is None:
+            self.timeout = 30
+
         if not self.tmpdir:
             self.tmpdir = mkdtemp()
             setattr(self, 'mkdtemp', True)
         if not isdir(self.tmpdir):
             raise ValueError(f'Invalid temporary directory: {self.tmpdir}.')
 
-        # Check executables (only for local commands, not for downloads)
         for key, exe in {'blast': 'makeblastdb', 'diamond': 'diamond'}.items():
             if self.compile in (key, 'both'):
                 if getattr(self, exe) is None:
@@ -221,7 +247,6 @@ class Database(object):
             else:
                 self.compile = 'diamond'
 
-        # Determine number of CPUs
         if self.compile in ('diamond', 'both') and not self.threads:
             try:
                 self.threads = len(os.sched_getaffinity(0))
@@ -233,28 +258,30 @@ class Database(object):
         makedirs(self.down, exist_ok=True)
 
     # ------------------------------------------------------------------------
-    # Download helper using urllib (replaces rsync)
+    # Helper: download a file using urllib (replaces rsync)
     # ------------------------------------------------------------------------
     def _download_file(self, url, dest_path, retries=None, delay=None):
-        """Download a file from URL to dest_path with retries."""
         if retries is None:
-            retries = self.retries if hasattr(self, 'retries') else 3
+            retries = self.retries
         if delay is None:
-            delay = self.delay if hasattr(self, 'delay') else 5
+            delay = self.delay
 
         for attempt in range(retries):
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=self.timeout if hasattr(self, 'timeout') else 30) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     with open(dest_path, 'wb') as f:
                         f.write(resp.read())
                 return True
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+                # If file not found (404), do not retry
+                if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+                    print(f"  File not found (404): {url}")
+                    raise
                 if attempt < retries - 1:
                     print(f"  Download failed: {e}. Retrying in {delay} seconds...")
                     sleep(delay)
                 else:
-                    print(f"  ERROR: Could not download {url} after {retries} attempts.")
                     raise
         return False
 
@@ -308,7 +335,7 @@ class Database(object):
         print(f'  Total number of genomes: {self.df.shape[0]}.')
 
     # ------------------------------------------------------------------------
-    # retrieve_categories: remove rsync dependency; direct HTTPS download
+    # retrieve_categories: use HTTPS
     # ------------------------------------------------------------------------
     def retrieve_categories(self):
         cats = self.cats
@@ -336,10 +363,7 @@ class Database(object):
                         asms_ = f.read().splitlines()
                 else:
                     print(f'Downloading {target} {cat} assembly list...', flush=True)
-                    try:
-                        self._download_file(url, lfile)
-                    except Exception:
-                        raise ValueError(f'Category "{cat}" not found for {target} (invalid category or network issue).')
+                    self._download_file(url, lfile)
                     with open(lfile, 'r') as f:
                         asms_ = [x.split('\t', 1)[0] for x in f.read().splitlines() if not x.startswith('#')]
 
@@ -355,7 +379,7 @@ class Database(object):
 
     # ------------------------------------------------------------------------
     # filter_genomes, sort_genomes, filter_by_taxonomy, sample_by_taxonomy,
-    # sample_by_quality, filter_to_sampled: unchanged from original (but keep)
+    # sample_by_quality, filter_to_sampled (unchanged from original logic)
     # ------------------------------------------------------------------------
     def filter_genomes(self):
         print('Filtering genomes...')
@@ -528,7 +552,7 @@ class Database(object):
         print(f'Total number of sampled genomes: {n}.')
 
     # ------------------------------------------------------------------------
-    # download_genomes: use HTTPS with urllib
+    # download_genomes: corrected URL construction
     # ------------------------------------------------------------------------
     def download_genomes(self):
         if self.manual:
@@ -544,6 +568,7 @@ class Database(object):
 
         for row in self.df.itertuples():
             g = row.genome
+            # Extract relative path from ftp_path (e.g., "genomes/all/GCF/000/002/415/GCF_000002415.2_ASM241v2")
             rdir = row.ftp_path.split('/', 3)[-1]
             stem = rdir.rsplit('/', 1)[-1]
             fname = f'{stem}_protein.faa.gz'
@@ -552,24 +577,23 @@ class Database(object):
             if self.check_local_file(lfile):
                 continue
 
-            # Build HTTPS URL from the ftp_path (replace ftp:// with https://)
-            url = row.ftp_path.replace('ftp://', 'https://') + f'/{fname}'
+            # Construct proper HTTPS URL
+            url = f'https://ftp.ncbi.nlm.nih.gov/{rdir}/{fname}'
 
             success = False
-            for i in range(self.retries):
+            for attempt in range(self.retries):
                 try:
-                    self._download_file(url, lfile, retries=1)  # single attempt inside loop
+                    self._download_file(url, lfile, retries=1)  # single attempt per loop
                     print('  ' + g, flush=True)
                     success = True
                     break
-                except Exception:
-                    if i < self.retries - 1:
+                except Exception as e:
+                    if attempt < self.retries - 1:
+                        print(f'  Retry {attempt+1}/{self.retries} for {g} after {self.delay}s')
                         sleep(self.delay)
                     else:
-                        break
-
+                        print(f'  ERROR: Could not download {url} after {self.retries} attempts.')
             if not success:
-                print(f'WARNING: Cannot retrieve {fname}.')
                 failed.append(g)
 
         print('Done.')
@@ -582,7 +606,7 @@ class Database(object):
 
     # ------------------------------------------------------------------------
     # extract_genomes, genome_lineages, genome_metadata, build_taxdump,
-    # build_taxonmap, compile_database: unchanged
+    # build_taxonmap, compile_database (unchanged)
     # ------------------------------------------------------------------------
     def extract_genomes(self):
         print('Extracting downloaded genomic data...', end='', flush=True)
@@ -606,7 +630,7 @@ class Database(object):
             g, tid = row.genome, row.taxid
             g2n[g], g2aa[g] = 0, 0
             stem = row.ftp_path.rsplit('/', 1)[-1]
-            lfile = join(ldir, f'{stem}_protein.faa.gz')
+            lfile = join(self.down, 'faa', f'{stem}_protein.faa.gz')
             with gzip.open(lfile, 'rb') as f:
                 try:
                     content = f.read().decode().splitlines()
@@ -778,13 +802,9 @@ class Database(object):
                 return True
         return False
 
-# ----------------------------------------------------------------------------
-# Command-line entry point (if run standalone)
-# ----------------------------------------------------------------------------
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description=description)
-    # Build argument parser from the 'arguments' structure
     for group in arguments:
         if isinstance(group, str):
             continue
@@ -796,4 +816,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
     db = Database()
     db(args)
-```
