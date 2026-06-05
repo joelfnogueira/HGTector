@@ -552,7 +552,7 @@ class Database(object):
         print(f'Total number of sampled genomes: {n}.')
 
     # ------------------------------------------------------------------------
-    # download_genomes: corrected URL construction
+    # download_genomes: corrected URL construction (with .rstrip('/'))
     # ------------------------------------------------------------------------
     def download_genomes(self):
         if self.manual:
@@ -568,8 +568,8 @@ class Database(object):
 
         for row in self.df.itertuples():
             g = row.genome
-            # Extract relative path from ftp_path (e.g., "genomes/all/GCF/000/002/415/GCF_000002415.2_ASM241v2")
-            rdir = row.ftp_path.split('/', 3)[-1]
+            # Extract relative path and remove trailing slash if any
+            rdir = row.ftp_path.split('/', 3)[-1].rstrip('/')
             stem = rdir.rsplit('/', 1)[-1]
             fname = f'{stem}_protein.faa.gz'
             lfile = join(ldir, fname)
@@ -577,7 +577,6 @@ class Database(object):
             if self.check_local_file(lfile):
                 continue
 
-            # Construct proper HTTPS URL
             url = f'https://ftp.ncbi.nlm.nih.gov/{rdir}/{fname}'
 
             success = False
@@ -630,7 +629,7 @@ class Database(object):
             g, tid = row.genome, row.taxid
             g2n[g], g2aa[g] = 0, 0
             stem = row.ftp_path.rsplit('/', 1)[-1]
-            lfile = join(self.down, 'faa', f'{stem}_protein.faa.gz')
+            lfile = join(ldir, f'{stem}_protein.faa.gz')
             with gzip.open(lfile, 'rb') as f:
                 try:
                     content = f.read().decode().splitlines()
